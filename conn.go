@@ -27,20 +27,21 @@ type Conn struct {
 	conn     net.Conn
 	isClient bool
 
-	phase handshakePhase
-
 	// constant after handshake; protected by handshakeMutex
 	handshakeMutex sync.Mutex // handshakeMutex < in.Mutex, out.Mutex, errMutex
 	// handshakeCond, if not nil, indicates that a goroutine is committed
 	// to running the handshake for this Conn. Other goroutines that need
 	// to wait for the handshake can wait on this, under handshakeMutex.
 	handshakeCond *sync.Cond
-	handshakeErr  error   // error resulting from handshake
-	connID        []byte  // Random connection id
-	clientHello   []byte  // ClientHello packet contents
-	vers          uint16  // TLS version
-	haveVers      bool    // version has been negotiated
-	config        *Config // configuration passed to constructor
+	// The transition from handshakeRunning to the next phase is covered by
+	// handshakeMutex. All others by in.Mutex.
+	phase        handshakeStatus
+	handshakeErr error   // error resulting from handshake
+	connID       []byte  // Random connection id
+	clientHello  []byte  // ClientHello packet contents
+	vers         uint16  // TLS version
+	haveVers     bool    // version has been negotiated
+	config       *Config // configuration passed to constructor
 	// handshakes counts the number of handshakes performed on the
 	// connection so far. If renegotiation is disabled then this is either
 	// zero or one.
@@ -103,16 +104,25 @@ type Conn struct {
 	// TLS 1.3 needs the server state until it reaches the Client Finished
 	hs *serverHandshakeState
 
+	// earlyDataBytes is the number of bytes of early data received so
+	// far. Tracked to enforce max_early_data_size.
+	earlyDataBytes int64
+
+	// bufferedEarlyData is used if ConfirmHandshake is called.
+	bufferedEarlyData bytes.Buffer
+
 	tmp [16]byte
 }
 
-type handshakePhase int
+type handshakeStatus int
 
 const (
-	earlyHandshake handshakePhase = iota
+	handshakeRunning handshakeStatus = iota
+	discardingEarlyData
+	readingEarlyData
 	waitingClientFinished
 	readingClientFinished
-	handshakeComplete
+	handshakeConfirmed
 )
 
 // Access to net.Conn methods.
@@ -615,12 +625,12 @@ func (c *Conn) readRecord(want recordType) error {
 		c.sendAlert(alertInternalError)
 		return c.in.setErrorLocked(errors.New("tls: unknown record type requested"))
 	case recordTypeHandshake, recordTypeChangeCipherSpec:
-		if c.phase != earlyHandshake && c.phase != readingClientFinished {
+		if c.phase != handshakeRunning && c.phase != readingClientFinished {
 			c.sendAlert(alertInternalError)
 			return c.in.setErrorLocked(errors.New("tls: handshake or ChangeCipherSpec requested while not in handshake"))
 		}
 	case recordTypeApplicationData:
-		if c.phase == earlyHandshake || c.phase == earlyHandshake {
+		if c.phase == handshakeRunning || c.phase == readingClientFinished {
 			c.sendAlert(alertInternalError)
 			return c.in.setErrorLocked(errors.New("tls: application data record requested while in handshake"))
 		}
@@ -686,7 +696,15 @@ Again:
 	// Process message.
 	b, c.rawInput = c.in.splitBlock(b, recordHeaderLen+n)
 	ok, off, alertValue := c.in.decrypt(b)
-	if !ok {
+	switch {
+	case !ok && c.phase == discardingEarlyData:
+		// If the client said that it's sending early data and we did not
+		// accept it, we are expected to fail decryption.
+		c.in.freeBlock(b)
+		goto Again
+	case ok && c.phase == discardingEarlyData:
+		c.phase = waitingClientFinished
+	case !ok:
 		c.in.freeBlock(b)
 		return c.in.setErrorLocked(c.sendAlert(alertValue))
 	}
@@ -730,6 +748,10 @@ Again:
 			c.in.setErrorLocked(io.EOF)
 			break
 		}
+		if alert(data[1]) == alertEndOfEarlyData {
+			c.handleEndOfEarlyData()
+			break
+		}
 		switch data[0] {
 		case alertLevelWarning:
 			// drop on the floor
@@ -752,11 +774,7 @@ Again:
 		}
 
 	case recordTypeApplicationData:
-		if c.phase == waitingClientFinished {
-			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
-			break
-		}
-		if typ != want {
+		if typ != want || c.phase == waitingClientFinished {
 			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 			break
 		}
@@ -1131,7 +1149,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 		return 0, err
 	}
 
-	if c.phase == earlyHandshake {
+	if c.phase == handshakeRunning {
 		return 0, alertInternalError
 	}
 
@@ -1198,11 +1216,25 @@ func (c *Conn) handleRenegotiation() error {
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
 
-	c.phase = earlyHandshake
+	c.phase = handshakeRunning
 	if c.handshakeErr = c.clientHandshake(); c.handshakeErr == nil {
 		c.handshakes++
 	}
 	return c.handshakeErr
+}
+
+// ConfirmHandshake waits for the handshake to reach a point at which
+// the connection is certainly not replayed. That is, after receiving
+// the Client Finished.
+//
+// If ConfirmHandshake returns an error and until ConfirmHandshake
+// returns, the 0-RTT data should not be trusted not to be replayed.
+//
+// This is only meaningful in TLS 1.3 when Accept0RTTData is true and the
+// client sent valid 0-RTT data. In any other case it's equivalent to
+// calling Hendshake.
+func (c *Conn) ConfirmHandshake() error {
+	panic("not implemented")
 }
 
 // Read can be made to time out and return a net.Error with Timeout() == true
@@ -1301,7 +1333,17 @@ func (c *Conn) Close() error {
 
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
-	if c.phase != earlyHandshake {
+	for c.phase == readingEarlyData {
+		if err := c.readRecord(recordTypeApplicationData); err != nil {
+			alertErr = err
+		}
+	}
+	if alertErr == nil && c.phase == waitingClientFinished {
+		if err := c.hs.readClientFinished13(); err != nil {
+			alertErr = err
+		}
+	}
+	if alertErr == nil && c.phase != handshakeRunning {
 		alertErr = c.closeNotify()
 	}
 
@@ -1319,7 +1361,7 @@ var errEarlyCloseWrite = errors.New("tls: CloseWrite called before handshake com
 func (c *Conn) CloseWrite() error {
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
-	if c.phase == earlyHandshake {
+	if c.phase == handshakeRunning {
 		return errEarlyCloseWrite
 	}
 
@@ -1341,8 +1383,11 @@ func (c *Conn) closeNotify() error {
 // protocol if it has not yet been run.
 // Most uses of this package need not call Handshake
 // explicitly: the first Read or Write will call it automatically.
+//
+// In TLS 1.3 Handshake returns after the client and server first flights,
+// without waiting for the Client Finished.
 func (c *Conn) Handshake() error {
-	// c.handshakeErr and c.phase == earlyHandshake are protected by
+	// c.handshakeErr and c.phase == handshakeRunning are protected by
 	// c.handshakeMutex. In order to perform a handshake, we need to lock
 	// c.in also and c.handshakeMutex must be locked after c.in.
 	//
@@ -1371,7 +1416,7 @@ func (c *Conn) Handshake() error {
 		if err := c.handshakeErr; err != nil {
 			return err
 		}
-		if c.phase != earlyHandshake {
+		if c.phase != handshakeRunning {
 			return nil
 		}
 		if c.handshakeCond == nil {
@@ -1393,7 +1438,7 @@ func (c *Conn) Handshake() error {
 
 	// The handshake cannot have completed when handshakeMutex was unlocked
 	// because this goroutine set handshakeCond.
-	if c.handshakeErr != nil || c.phase != earlyHandshake {
+	if c.handshakeErr != nil || c.phase != handshakeRunning {
 		panic("handshake should not have been able to complete after handshakeCond was set")
 	}
 
@@ -1415,7 +1460,7 @@ func (c *Conn) Handshake() error {
 		c.flush()
 	}
 
-	if c.handshakeErr == nil && c.phase == earlyHandshake {
+	if c.handshakeErr == nil && c.phase == handshakeRunning {
 		panic("handshake should have had a result.")
 	}
 
@@ -1433,7 +1478,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 	defer c.handshakeMutex.Unlock()
 
 	var state ConnectionState
-	state.HandshakeComplete = c.phase != earlyHandshake
+	state.HandshakeComplete = c.phase != handshakeRunning
 	state.ServerName = c.serverName
 
 	if state.HandshakeComplete {
@@ -1448,6 +1493,14 @@ func (c *Conn) ConnectionState() ConnectionState {
 		state.VerifiedChains = c.verifiedChains
 		state.SignedCertificateTimestamps = c.scts
 		state.OCSPResponse = c.ocspResponse
+		state.HandshakeConfirmed = c.phase == handshakeConfirmed
+		// Some packages, like net/http, will call ConnectionState before Read.
+		// Techincally at that point HandshakeConfirmed is false, but if we know
+		// Read is not going to return any unconfirmed byte, we help them by
+		// predicting true.
+		if c.hs != nil && c.hs.hello13Enc != nil && !c.hs.hello13Enc.earlyData {
+			state.HandshakeConfirmed = true
+		}
 		if !c.didResume {
 			if c.clientFinishedIsFirst {
 				state.TLSUnique = c.clientFinished[:]
@@ -1478,7 +1531,7 @@ func (c *Conn) VerifyHostname(host string) error {
 	if !c.isClient {
 		return errors.New("tls: VerifyHostname called on TLS server connection")
 	}
-	if c.phase == earlyHandshake {
+	if c.phase == handshakeRunning {
 		return errors.New("tls: handshake has not yet been performed")
 	}
 	if len(c.verifiedChains) == 0 {
